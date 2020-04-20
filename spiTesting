@@ -1,0 +1,472 @@
+/**
+ * Copyright (c) 2015 - 2019, Nordic Semiconductor ASA
+ *
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without modification,
+ * are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form, except as embedded into a Nordic
+ *    Semiconductor ASA integrated circuit in a product or a software update for
+ *    such product, must reproduce the above copyright notice, this list of
+ *    conditions and the following disclaimer in the documentation and/or other
+ *    materials provided with the distribution.
+ *
+ * 3. Neither the name of Nordic Semiconductor ASA nor the names of its
+ *    contributors may be used to endorse or promote products derived from this
+ *    software without specific prior written permission.
+ *
+ * 4. This software, with or without modification, must only be used with a
+ *    Nordic Semiconductor ASA integrated circuit.
+ *
+ * 5. Any software provided in binary form under this license must not be reverse
+ *    engineered, decompiled, modified and/or disassembled.
+ *
+ * THIS SOFTWARE IS PROVIDED BY NORDIC SEMICONDUCTOR ASA "AS IS" AND ANY EXPRESS
+ * OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY, NONINFRINGEMENT, AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL NORDIC SEMICONDUCTOR ASA OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+ * GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ */
+/** @file
+ * @defgroup pwm_example_main main.c
+ * @{
+ * @ingroup pwm_example
+ *
+ * @brief  PWM Example Application main file.
+ *
+ * This file contains the source code for a sample application using PWM.
+ *
+ *
+ */
+
+#include <stdbool.h>
+#include <stdint.h>
+#include "nrf.h"
+#include "app_error.h"
+#include "bsp.h"
+#include "nrf_delay.h"
+#include "app_pwm.h"
+
+//TWI includes
+#include "boards.h"
+#include "app_util_platform.h"
+#include "nrf_drv_twi.h"
+#include "nrf_log.h"
+#include "nrf_log_ctrl.h"
+#include "nrf_log_default_backends.h"
+#include "math.h"
+
+#include "twi_MPU.h"
+
+//PID includes
+#include "arm_math.h"
+
+//RTOS includes
+#define osObjectsPublic
+#include "cmsis_os.h"
+#include "osObjects.h"  
+
+//SPI includes
+#include "nrf_drv_spi.h"
+
+
+
+
+///////////THREAD////////////////
+
+
+//---------------TWI-------------
+/* TWI instance ID. */
+#if TWI0_ENABLED
+#define TWI_INSTANCE_ID     0
+#elif TWI1_ENABLED
+#define TWI_INSTANCE_ID     1
+#endif
+
+
+/* TWI instance. */
+//MPU
+static const nrf_drv_twi_t m_twi = NRF_DRV_TWI_INSTANCE(TWI_INSTANCE_ID);
+
+//TWI initializer
+void twi_init (void)
+{
+    ret_code_t err_code;
+
+    const nrf_drv_twi_config_t twi_config = {
+       .scl                = ARDUINO_SCL_PIN,
+       .sda                = ARDUINO_SDA_PIN,
+       .frequency          = NRF_DRV_TWI_FREQ_100K,
+       .interrupt_priority = APP_IRQ_PRIORITY_HIGH,
+       .clear_bus_init     = false
+    };
+    
+		
+    err_code = nrf_drv_twi_init(&m_twi, &twi_config, NULL, NULL);
+    APP_ERROR_CHECK(err_code);
+
+    nrf_drv_twi_enable(&m_twi);
+}
+
+
+
+//----SPI
+
+#define SPI_INSTANCE  2 /**< SPI instance index. */
+static const nrf_drv_spi_t spi = NRF_DRV_SPI_INSTANCE(SPI_INSTANCE);  /**< SPI instance. */
+static volatile bool spi_xfer_done;  /**< Flag used to indicate that SPI instance completed the transfer. */
+
+#define TEST_STRING "Nordic"
+static uint8_t       m_tx_buf[] = TEST_STRING;           /**< TX buffer. */
+static uint8_t       m_rx_buf[sizeof(TEST_STRING) + 1];    /**< RX buffer. */
+static const uint8_t m_length = sizeof(m_tx_buf);        /**< Transfer length. */
+
+/**
+ * @brief SPI user event handler.
+ * @param event
+ */
+void spi_event_handler(nrf_drv_spi_evt_t const * p_event,
+                       void *                    p_context)
+{
+    spi_xfer_done = true;
+//    NRF_LOG_INFO("Transfer completed.");
+    if (m_rx_buf[0] != 0)
+    {
+        NRF_LOG_INFO(" Received %s", m_rx_buf);
+        //NRF_LOG_HEXDUMP_INFO(m_rx_buf, strlen((const char *)m_rx_buf));
+    }
+}
+
+
+//Buffer for MPU
+static uint8_t sample_data[6];
+
+//Accel X high register
+uint8_t StartReg = 0x3B;
+	
+//Gyro X high register
+uint8_t StartReg2 = 0x43;
+
+void MPU6050Read();
+void SPI();
+
+//MESSAGE Q DEFINITION
+osMessageQId read_msg_qid1;
+osMessageQId read_msg_qid2;
+osMessageQId read_msg_qid7;
+
+osMessageQDef(read_msg_queue1, 25, int_16t);
+osMessageQDef(read_msg_queue2, 25, int_16t);
+osMessageQDef(read_msg_queue7, 25, int_16t);
+
+//To send to SPI
+osMessageQId read_msg_qid3;
+osMessageQId read_msg_qid4;
+osMessageQId read_msg_qid5;
+osMessageQId read_msg_qid6;
+
+osMessageQDef(read_msg_queue3, 25, int_8t);
+osMessageQDef(read_msg_queue4, 25, int_8t);
+osMessageQDef(read_msg_queue5, 25, int_8t);
+osMessageQDef(read_msg_queue6, 25, int_8t);
+
+//------------THREADS---------
+osThreadId tid_Thread1;
+osThreadDef (MPU6050Read, osPriorityNormal, 1, 0);
+
+osThreadId tid_Thread2;
+osThreadDef (SPI, osPriorityNormal, 1, 0);
+
+
+int Init_MPU6050Read (void) {
+
+	twi_init();
+	
+	//MESSAGE Q CREATION
+	read_msg_qid1 = osMessageCreate(osMessageQ(read_msg_queue1), NULL);
+	read_msg_qid2 = osMessageCreate(osMessageQ(read_msg_queue2), NULL);
+	read_msg_qid7 = osMessageCreate(osMessageQ(read_msg_queue7), NULL);
+	
+	//Power management register
+	uint8_t PowerMgt = 0x6B;
+	uint8_t PowerReg = 0;
+	
+	uint8_t wakeup[2];
+	wakeup[0] = PowerMgt;
+	wakeup[1] = PowerReg;
+		
+	//Wakeup MPU6050
+	nrf_drv_twi_tx(&m_twi, 0x68, wakeup, 2, false);
+	
+	
+  tid_Thread1 = osThreadCreate (osThread(MPU6050Read), (void *) NULL);
+  if (!tid_Thread1) return(-1);
+	NRF_LOG_INFO("MPU thread created");
+	NRF_LOG_FLUSH();
+	
+  return(0);
+}
+
+
+void MPU6050Read(){
+	
+	while(true){
+				nrf_delay_ms(50);
+				
+				//Start at Accel_X_high
+        nrf_drv_twi_tx(&m_twi, 0x68, &StartReg, 1, false);
+			
+				nrf_drv_twi_rx(&m_twi, 0x68, sample_data, 6);
+				
+				//Accel values
+				int16_t x_val = ((sample_data[0]<<8)|sample_data[1]);
+				int16_t y_val = ((sample_data[2]<<8)|sample_data[3]);
+				int16_t z_val = ((sample_data[4]<<8)|sample_data[5]);
+
+//				//Calculating	angle
+//				int8_t angleAccelX = atan(y_val / sqrt(pow(x_val, 2) + pow(z_val, 2))) * 180 / acos(-1);
+//			  int8_t angleAccelY = atan(-1 * x_val / sqrt(pow(y_val, 2) + pow(z_val, 2))) * 180 / acos(-1);
+//		
+//		
+//				
+//	
+//				int16_t Angles = ((int16_t)angleAccelX << 8) | angleAccelY;
+//				
+//	
+//				osMessagePut(read_msg_qid1, angleAccelX, 0);
+//				osMessagePut(read_msg_qid2, angleAccelY, 0);
+
+				osMessagePut(read_msg_qid1, x_val, 0);
+				osMessagePut(read_msg_qid2, y_val, 0);
+				osMessagePut(read_msg_qid7, z_val, 0);
+	}
+
+}
+
+int Init_SPI(void){
+		////////---------------SPI-------------////////
+		//SPI CONFIG
+    nrf_drv_spi_config_t spi_config = NRF_DRV_SPI_DEFAULT_CONFIG;
+    spi_config.ss_pin   = SPI_SS_PIN;
+    spi_config.miso_pin = SPI_MISO_PIN;
+    spi_config.mosi_pin = SPI_MOSI_PIN;
+    spi_config.sck_pin  = SPI_SCK_PIN;
+    APP_ERROR_CHECK(nrf_drv_spi_init(&spi, &spi_config, spi_event_handler, NULL));
+	
+	tid_Thread2 = osThreadCreate (osThread(SPI), (void *) NULL);
+  if (!tid_Thread2) return(-1);
+	NRF_LOG_INFO("SPI thread created");
+	NRF_LOG_FLUSH();
+return(0);
+}
+
+void SPI(){
+	osEvent my_event3;
+	osEvent my_event4;
+	osEvent my_event5;
+	osEvent my_event6;
+	while(true){
+		
+	      my_event3 = osMessageGet(read_msg_qid3, osWaitForever);
+			  my_event4 = osMessageGet(read_msg_qid4, osWaitForever);
+				my_event5 = osMessageGet(read_msg_qid5, osWaitForever);
+				my_event6 = osMessageGet(read_msg_qid6, osWaitForever);
+		
+	//TRY TO PUT SAMPLE DATA IN TX BUFFER
+				m_tx_buf[0] = my_event3.value.v;
+				m_tx_buf[1] = my_event4.value.v;
+				m_tx_buf[2] = my_event5.value.v;
+				m_tx_buf[3] = my_event6.value.v;
+				
+					// Reset rx buffer and transfer done flag
+					memset(m_rx_buf, 0, m_length);
+					spi_xfer_done = false;
+
+					APP_ERROR_CHECK(nrf_drv_spi_transfer(&spi, m_tx_buf, m_length, m_rx_buf, m_length));
+
+					while (!spi_xfer_done)
+					{
+							__WFE();
+					}
+					NRF_LOG_FLUSH();
+//					value++;
+//					SPI_one_time_transfer++;
+					nrf_delay_ms(1000);
+//			}
+		
+		
+	}
+}
+
+////////////THREAD END///////////////
+
+
+
+//--------------PWM-----------------
+//PWM instance
+APP_PWM_INSTANCE(PWM1,1);                   // Create the instance "PWM1" using TIMER1.
+APP_PWM_INSTANCE(PWM2,0);  
+
+
+////-------------PID-------------------
+//float32_t  setPoint = 0;  
+////float32_t  motorOut = 0;
+//float32_t  AngleX = 0;
+//float32_t  AngleY = 0;
+
+//arm_pid_instance_f32 S;
+
+
+int main(void)
+{
+	
+	
+		//------------TWI-----------
+//	
+				//LOG initializer
+		NRF_LOG_INIT(NULL);
+	  NRF_LOG_DEFAULT_BACKENDS_INIT();
+		
+	
+		osKernelInitialize();
+		Init_MPU6050Read();
+		Init_SPI();
+		osKernelStart();
+	
+	
+
+		
+		//////////////////////////////////////////////
+		
+		//-----PWM---------
+    ret_code_t err_code;
+
+    //PWM config
+    app_pwm_config_t pwm1_cfg = APP_PWM_DEFAULT_CONFIG_2CH(2040L, BSP_LED_0, BSP_LED_1);
+	  app_pwm_config_t pwm2_cfg = APP_PWM_DEFAULT_CONFIG_2CH(2040L, BSP_LED_2, BSP_LED_3);
+		
+		
+
+    /* Initialize and enable PWM. */
+    err_code = app_pwm_init(&PWM1,&pwm1_cfg, NULL);
+    APP_ERROR_CHECK(err_code);
+    app_pwm_enable(&PWM1);
+	
+	  err_code = app_pwm_init(&PWM2,&pwm2_cfg, NULL);
+    APP_ERROR_CHECK(err_code);
+    app_pwm_enable(&PWM2);
+		
+
+		
+//		//--------PID------
+//		S.Kp = 1;			  								
+//		S.Ki = 1;
+//		S.Kd = 1;
+//		setPoint = 0;
+//		arm_pid_init_f32	(	&S,0);
+
+
+	//MESSAGE Q CREATION FOR SPI
+	read_msg_qid3 = osMessageCreate(osMessageQ(read_msg_queue3), NULL);
+	read_msg_qid4 = osMessageCreate(osMessageQ(read_msg_queue4), NULL);
+	read_msg_qid5 = osMessageCreate(osMessageQ(read_msg_queue5), NULL);
+	read_msg_qid6 = osMessageCreate(osMessageQ(read_msg_queue6), NULL);
+
+    while (true)
+    {
+			
+//						//-----------MPU6050----------
+				//nrf_delay_ms(200);
+			
+			
+				osEvent my_event;
+				osEvent my_event2;
+				osEvent my_event7;
+////				osMessageQId read_msg_qid;
+				my_event = osMessageGet(read_msg_qid1, osWaitForever);
+			  my_event2 = osMessageGet(read_msg_qid2, osWaitForever);
+				my_event7 = osMessageGet(read_msg_qid7, osWaitForever);
+
+				
+				int16_t AccelX = my_event.value.v;
+				int16_t AccelY = my_event2.value.v;
+			  int16_t AccelZ = my_event7.value.v;
+			
+				//Calculating	angle
+				int8_t angleAccelX = atan(AccelX / sqrt(pow(AccelX, 2) + pow(AccelZ, 2))) * 180 / acos(-1);
+			  int8_t angleAccelY = atan(-1 * AccelX / sqrt(pow(AccelY, 2) + pow(AccelZ, 2))) * 180 / acos(-1);
+				
+
+//				NRF_LOG_INFO("Acc angle X:%i, Y:%i", angleAccelX, angleAccelY);
+//				NRF_LOG_INFO("_____")
+//				NRF_LOG_FLUSH();			
+			
+			/////////////////////////////////////
+			// ------PWM----------
+			
+						int8_t LED1;
+						int8_t LED2;
+						int8_t LED3;
+						int8_t LED4;
+						
+						LED1 = 50+((angleAccelX * 0.55)) - ((angleAccelY * 0.55));
+						LED2 = 50-((angleAccelX * 0.55)) - ((angleAccelY * 0.55));
+						LED3 = 50+((angleAccelY * 0.55)) + ((angleAccelX * 0.55));
+						LED4 = 50+((angleAccelY * 0.55)) - ((angleAccelX * 0.55));
+
+//				AngleX = arm_pid_f32	(	&S, setPoint - angleAccelX);
+//				AngleY = arm_pid_f32	(	&S, setPoint - angleAccelY);
+//				
+//				NRF_LOG_INFO("PID values %i, %i", AngleX, AngleY);
+//				NRF_LOG_FLUSH();
+						
+
+						
+//				NRF_LOG_INFO("%i, %i, %i, %i", LED1, LED2, LED3, LED4);
+//				NRF_LOG_INFO("_____")
+//				NRF_LOG_FLUSH();	
+//						
+						
+						switch(m_rx_buf[0]){
+							case 1:
+								osMessagePut(read_msg_qid3, angleAccelX, 0);
+								osMessagePut(read_msg_qid4, angleAccelY, 0);
+							case 2:
+								osMessagePut(read_msg_qid3, AccelX, 0);
+								osMessagePut(read_msg_qid4, AccelY, 0);
+								osMessagePut(read_msg_qid5, AccelZ, 0);
+							case 3:
+								osMessagePut(read_msg_qid3, LED1, 0);
+								osMessagePut(read_msg_qid4, LED2, 0);
+								osMessagePut(read_msg_qid5, LED3, 0);
+							  osMessagePut(read_msg_qid6, LED4, 0);
+						}
+						
+						
+            /* Set the duty cycle - keep trying until PWM is ready... */
+						
+						//LED1
+            while (app_pwm_channel_duty_set(&PWM1, 0, LED1) == NRF_ERROR_BUSY);
+						//LED2
+						while (app_pwm_channel_duty_set(&PWM1, 1, LED2) == NRF_ERROR_BUSY);
+						//LED3
+						while (app_pwm_channel_duty_set(&PWM2, 0, LED3) == NRF_ERROR_BUSY);
+						//LED4
+						while (app_pwm_channel_duty_set(&PWM2, 1, LED4) == NRF_ERROR_BUSY);	
+
+    }
+
+}
+
+
+/** @} */
